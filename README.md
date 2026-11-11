@@ -16,16 +16,29 @@
 
 ## 环境要求
 
-- Linux 主机，root 权限
-- Alpine Linux（OpenRC）为主要目标平台，其他发行版可用，持久化方式随 init 系统而定
-- iptables：缺失时由脚本按 `apk` / `apt` / `dnf` / `yum` / `microdnf` / `opkg` 自动安装
+- Linux 主机，root 权限（普通用户可用 `sudo`，脚本会自动提权重跑）
+- 支持 Alpine（OpenRC）、Debian 12+、Ubuntu 22.04+（systemd），其他发行版可用，开机自启随 init 系统而定
+- iptables：缺失时由脚本按 `apk` / `apt` / `dnf` / `yum` / `microdnf` / `opkg` 自动安装，apt 索引过期会自动 `update` 后重试
+- 内核需支持 nat 表；Docker 等容器另需 `NET_ADMIN` / `NET_RAW` 能力
 
 ## 快速开始
+
+Alpine：
 
 ```sh
 wget -qO /tmp/portfwd.sh https://raw.githubusercontent.com/louwailou777/alpine-portfwd/main/portfwd.sh
 sh /tmp/portfwd.sh
 ```
+
+Debian / Ubuntu（普通用户加 `sudo`）：
+
+```sh
+curl -fsSL -o /tmp/portfwd.sh https://raw.githubusercontent.com/louwailou777/alpine-portfwd/main/portfwd.sh
+sudo sh /tmp/portfwd.sh
+```
+
+> 系统没有 `curl` 就把第一条换成 `wget -qO /tmp/portfwd.sh <同一地址>`；
+> 两者都没有时先装一个：`apt-get install -y curl`。
 
 执行后进入交互式配置，依次为：
 
@@ -93,12 +106,24 @@ portfwd.sh 10888 1.2.3.4 8443 10889 1.2.3.4 8080
 ```
 
 手工修改该文件后执行 `portfwd.sh apply` 生效。
+`portfwd.sh open-port` 放行的端口记录在 `/etc/portfwd.open`，开机时一并重放。
 
-持久化由三部分组成：
+开机自启按系统的 init 系统分别处理：
 
-1. 规则保存至 `/etc/iptables/rules-save`
-2. `rc-update add iptables default`，由 OpenRC 服务开机恢复
-3. `/etc/local.d/portfwd.start` 开机重放配置，保证 `ip_forward` 与映射一致
+**systemd（Debian / Ubuntu）**
+
+- 安装 `/etc/systemd/system/portfwd.service` 并 `systemctl enable portfwd.service`
+- 服务在 `network-pre.target` 之前执行 `/usr/local/sbin/portfwd boot`，
+  按 `/etc/portfwd.conf` 与 `/etc/portfwd.open` 重放规则
+- 手动重放：`systemctl reload portfwd.service` 或 `portfwd.sh apply`
+
+**OpenRC（Alpine）**
+
+- 规则快照保存至 `/etc/iptables/rules-save`，`rc-update add iptables default` 开机恢复
+- `/etc/local.d/portfwd.start` 开机重放配置，保证 `ip_forward` 与映射一致
+
+两种方式都**不会还原整份 iptables 快照**，只重建带 `portfwd:` 标记的规则，
+以免覆盖 ufw、docker、fail2ban 等自行维护的链。
 
 ## 线路质量判定
 
@@ -137,7 +162,9 @@ sysctl -w net.ipv4.ip_forward=1
 | 落地机端口不通 | 落地机服务是否监听、防火墙是否放行 |
 | 能 ping 通但转发失败 | `net.ipv4.ip_forward` 是否为 1；`FORWARD` 链策略是否被改为 DROP |
 | ping 100% 丢包 | 落地机可能屏蔽 ICMP，不代表 TCP 不通，可用 `portfwd.sh test` 复核 |
-| 在容器内运行 | 需 `--cap-add NET_ADMIN --cap-add NET_RAW --sysctl net.ipv4.ip_forward=1`，且无 OpenRC，不启用开机自启 |
+| Ubuntu/Debian 上端口放行无效 | 若启用了 ufw，需用 `ufw allow <端口>/tcp` 与 `ufw allow <端口>/udp`，ufw 会覆盖手工 INPUT 规则 |
+| 重启后规则消失 | `systemctl status portfwd.service` 查看服务状态；确认 `/etc/portfwd.conf` 存在且 `boot` 能执行 |
+| 在容器内运行 | 需 `--cap-add NET_ADMIN --cap-add NET_RAW --sysctl net.ipv4.ip_forward=1`，容器无 init，不启用开机自启 |
 | Alpine diskless 模式 | 执行 `lbu commit` 保存 `/etc` 与 `/usr/local` 变更 |
 | raw 地址无法访问 | 改用 CDN：`https://cdn.jsdelivr.net/gh/louwailou777/alpine-portfwd@main/portfwd.sh` |
 
@@ -147,7 +174,8 @@ sysctl -w net.ipv4.ip_forward=1
 portfwd.sh uninstall
 ```
 
-该命令会删除所有带 `portfwd:` 标记的规则、`/etc/portfwd.conf`、开机钩子与 `/usr/local/sbin/portfwd`。
+该命令会删除所有带 `portfwd:` 标记的规则、`/etc/portfwd.conf`、systemd 服务或 OpenRC 钩子，
+以及 `/usr/local/sbin/portfwd`。
 `net.ipv4.ip_forward` 保持开启，如需关闭：`sysctl -w net.ipv4.ip_forward=0`。
 
 ## License

@@ -18,20 +18,31 @@
 #     * 幂等：加规则前先 `iptables -C` 查重，绝不叠加
 #     * 标记：自己加的规则带 portfwd: 注释，重放前先清掉旧的，换落地机不留残留
 #     * 配置：映射落在 /etc/portfwd.conf，改端口=改文件+apply
-#     * 持久：iptables save + rc-update + /etc/local.d 开机钩子
+#     * 持久：iptables save + systemd 服务 / OpenRC 钩子 + 开机重放
 #
 #  精简系统适配（先补依赖，再动手）：
 #     * 自动识别包管理器（apk / apt / dnf / yum / microdnf / opkg）并装 iptables
+#     * apt 索引过期时先 update 再重试安装
 #     * 显式 modprobe 内核模块（ip_tables / iptable_nat / nf_nat / xt_MASQUERADE ...）
 #     * iptables 默认后端不可用时自动切到 iptables-legacy / iptables-nft
 #     * 缺 busybox applet（awk/sed/cut/mktemp...）时尝试补 busybox/coreutils
 #     * 只依赖 POSIX sh，不依赖 xargs/sed 删除规则、不依赖 bash 数组
 #     * 没有 sysctl 就直接写 /proc；没有 iptables-save 就靠开机钩子重放
+#
+#  发行版支持：
+#     * Alpine（OpenRC）：/etc/local.d/portfwd.start + rc-update
+#     * Debian / Ubuntu（systemd）：/etc/systemd/system/portfwd.service
+#     * 容器 / 其他 init：跳过开机自启，其余功能不受影响
+#     * 普通用户执行时自动 sudo 提权（不使用 sudo -E，兼容默认 sudoers）
 # =============================================================================
 
-VERSION="1.0.0"
+# 说明：下面出现的 "-j $target" 有意不加引号 —— iptables 的 target 需要拆成多个
+# 参数（例如 DNAT --to-destination 1.2.3.4:443），因此本文件忽略 SC2086。
+# shellcheck disable=SC2086
+VERSION="1.1.0"
 
 CONF=${CONF:-/etc/portfwd.conf}
+OPEN_FILE=${OPEN_FILE:-/etc/portfwd.open}
 IPT=${IPT:-iptables}
 QUIET=0
 ASSUME_YES=0
@@ -88,14 +99,23 @@ need_root() {
 	die "需要 root 权限，请用 root 运行（su - 后再执行）"
 }
 
-# 启动时统一处理提权：能 sudo 就自己重跑一次（保留全部参数）
+# 判断 $0 是不是一个真实脚本文件（sh -c / 管道执行时为假）
+is_real_script() {
+	case "$SELF" in
+	'' | sh | */sh | /bin/busybox | /bin/dash) return 1 ;;
+	esac
+	[ -f "$SELF" ]
+}
+
+# 启动时统一处理提权：能 sudo 就自己重跑一次
+# 注意不要用 sudo -E：Ubuntu/Debian 默认 sudoers 没有 SETENV，-E 会直接报错
 escalate_if_needed() {
 	[ "$(id -u)" = "0" ] && return 0
-	if command -v sudo >/dev/null 2>&1 && [ -f "$0" ]; then
-		info "需要 root，尝试用 sudo 重新执行 ..."
-		exec sudo -E sh "$0" "$@"
+	if command -v sudo >/dev/null 2>&1 && is_real_script; then
+		info "需要 root，正在通过 sudo 重新执行 ..."
+		exec sudo sh "$SELF" "$@"
 	fi
-	die "需要 root 权限。请执行 su - 后再运行，或在命令前加 sudo"
+	die "需要 root 权限。请用 sudo 运行：sudo sh $0"
 }
 
 # -----------------------------------------------------------------------------
@@ -111,6 +131,17 @@ detect_pkg() {
 	else PKG=""; fi
 }
 
+pkg_update() {
+	case "$PKG" in
+	apk) apk update >/dev/null 2>&1 ;;
+	apt) apt-get update >/dev/null 2>&1 ;;
+	dnf) dnf makecache >/dev/null 2>&1 ;;
+	yum) yum makecache >/dev/null 2>&1 ;;
+	microdnf) microdnf makecache >/dev/null 2>&1 ;;
+	opkg) opkg update >/dev/null 2>&1 ;;
+	esac
+}
+
 pkg_install() { # 包名...
 	[ -n "$PKG" ] && [ $# -gt 0 ] || return 1
 	case "$PKG" in
@@ -122,6 +153,15 @@ pkg_install() { # 包名...
 	opkg) opkg update >/dev/null 2>&1; opkg install "$@" >/dev/null 2>&1 ;;
 	*) return 1 ;;
 	esac
+}
+
+# 先直接装；失败（apt 索引太旧是常见原因）就刷新索引再试一次
+pkg_ensure() { # 包名...
+	[ -n "$PKG" ] && [ $# -gt 0 ] || return 1
+	pkg_install "$@" && return 0
+	pkg_update
+	pkg_install "$@" && return 0
+	return 1
 }
 
 # 精简系统常常没自动带出 iptables 的内核模块，显式 modprobe 一遍
@@ -151,7 +191,7 @@ ensure_iptables() {
 	fi
 	if ! command -v "$IPT" >/dev/null 2>&1; then
 		info "未检测到 iptables，正在安装 ..."
-		pkg_install iptables || pkg_install iptables-nft || true
+		pkg_ensure iptables || pkg_ensure iptables-nft || true
 	fi
 	command -v "$IPT" >/dev/null 2>&1 ||
 		die "装不上 iptables（包管理器: ${PKG:-未识别}）。请手动安装后重试"
@@ -170,7 +210,8 @@ ensure_iptables() {
   - 容器里需要 --cap-add NET_ADMIN --cap-add NET_RAW
   - 精简系统可能缺内核模块，手动执行：
       modprobe ip_tables iptable_nat nf_nat xt_MASQUERADE xt_comment
-  - Alpine 上确认已装：apk add iptables"
+  - Alpine:     apk add iptables
+  - Debian/Ubuntu: apt-get install -y iptables"
 	ok "iptables 可用（$IPT）"
 
 	command -v iptables-save >/dev/null 2>&1 ||
@@ -189,7 +230,7 @@ ensure_tools() {
 	fi
 	info "缺少命令:$_et_miss  — 尝试补装 ..."
 	case "$PKG" in
-	apk) pkg_install busybox coreutils gawk ;;
+	apk) pkg_ensure busybox coreutils gawk ;;
 	apt) pkg_install coreutils gawk procps ;;
 	dnf | yum) pkg_install coreutils gawk procps-ng ;;
 	microdnf) pkg_install coreutils gawk procps-ng ;;
@@ -332,7 +373,7 @@ verify_entry() { # L R P
 apply_all() {
 	del_tagged
 	aa_n=0
-	while read -r aa_l aa_r aa_p aa_x; do
+	while read -r aa_l aa_r aa_p _; do
 		[ -n "${aa_l:-}" ] || continue
 		[ -n "${aa_p:-}" ] || { warn "配置行不完整，跳过: $aa_l $aa_r"; continue; }
 		apply_entry "$aa_l" "$aa_r" "$aa_p"
@@ -342,7 +383,7 @@ $(conf_read)
 EOF
 
 	aa_bad=0
-	while read -r aa_l aa_r aa_p aa_x; do
+	while read -r aa_l aa_r aa_p _; do
 		[ -n "${aa_l:-}" ] || continue
 		verify_entry "$aa_l" "$aa_r" "$aa_p" || aa_bad=1
 	done <<EOF
@@ -511,9 +552,8 @@ confirm() { # $1=提示 $2=默认(y/n，缺省 y)
 copy_self() {
 	case "$SELF" in
 	/usr/local/sbin/portfwd) return 0 ;;
-	'' | sh | */sh | /bin/sh | /usr/bin/sh | /bin/busybox | /bin/dash) return 1 ;;
 	esac
-	[ -f "$SELF" ] || return 1
+	is_real_script || return 1
 	mkdir -p /usr/local/sbin 2>/dev/null || return 1
 	cp "$SELF" /usr/local/sbin/portfwd 2>/dev/null || return 1
 	chmod 0755 /usr/local/sbin/portfwd 2>/dev/null || return 1
@@ -524,20 +564,45 @@ write_boot_hook() {
 	[ -d /etc/local.d ] || return 1
 	cat >/etc/local.d/portfwd.start <<'EOS'
 #!/bin/sh
-# 由 portfwd.sh 生成：开机恢复 IPv4 转发，并按 /etc/portfwd.conf 重放映射
-sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] || echo 1 >/proc/sys/net/ipv4/ip_forward 2>/dev/null
+# 由 portfwd.sh 生成：开机重放 /etc/portfwd.conf 与 /etc/portfwd.open
 if [ -x /usr/local/sbin/portfwd ]; then
-	/usr/local/sbin/portfwd apply >/dev/null 2>&1
-elif command -v iptables-restore >/dev/null 2>&1 && [ -r /etc/iptables/rules-save ]; then
-	iptables-restore </etc/iptables/rules-save >/dev/null 2>&1
+	/usr/local/sbin/portfwd boot >/dev/null 2>&1
+else
+	sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+	[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] || echo 1 >/proc/sys/net/ipv4/ip_forward 2>/dev/null
 fi
 EOS
 	chmod 0755 /etc/local.d/portfwd.start 2>/dev/null
 	return 0
 }
 
+# systemd（Ubuntu / Debian / CentOS 等）
+write_systemd_unit() {
+	[ -d /etc/systemd/system ] || return 1
+	cat >/etc/systemd/system/portfwd.service <<'EOS'
+[Unit]
+Description=portfwd NAT forwarding rules
+Documentation=https://github.com/louwailou777/alpine-portfwd
+Before=network-pre.target
+Wants=network-pre.target
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/portfwd boot
+ExecReload=/usr/local/sbin/portfwd apply
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target
+EOS
+	chmod 0644 /etc/systemd/system/portfwd.service 2>/dev/null
+	return 0
+}
+
 persist() {
+	# 1) 保存当前规则快照（OpenRC 与兜底恢复都用得上）
 	if [ -x /etc/init.d/iptables ]; then
 		/etc/init.d/iptables save >/dev/null 2>&1
 	fi
@@ -546,17 +611,35 @@ persist() {
 		iptables-save >/etc/iptables/rules-save 2>/dev/null ||
 			warn "规则写入 /etc/iptables/rules-save 失败"
 	fi
-	# Debian / Ubuntu 系
 	if command -v netfilter-persistent >/dev/null 2>&1; then
 		netfilter-persistent save >/dev/null 2>&1 && ok "规则已保存（netfilter-persistent）"
 	fi
 
-	if command -v rc-update >/dev/null 2>&1 && [ -d /run/openrc ]; then
+	# 2) 开机自启：按 init 系统分别处理
+	if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+		if copy_self; then
+			ok "脚本已安装到 /usr/local/sbin/portfwd"
+			if write_systemd_unit; then
+				systemctl daemon-reload >/dev/null 2>&1
+				if systemctl enable portfwd.service >/dev/null 2>&1; then
+					ok "systemd 服务已启用（portfwd.service）"
+				else
+					warn "systemctl enable portfwd.service 失败"
+				fi
+			else
+				warn "写入 /etc/systemd/system/portfwd.service 失败"
+			fi
+			ok "规则已保存，重启自动恢复"
+		else
+			warn "脚本没能装到 /usr/local/sbin/portfwd，跳过开机自启"
+			warn "如需重启后仍生效，请把它放到固定路径后执行：portfwd.sh save"
+		fi
+	elif command -v rc-update >/dev/null 2>&1 && [ -d /run/openrc ]; then
 		rc-update add iptables default >/dev/null 2>&1
 		if copy_self; then
 			ok "脚本已安装到 /usr/local/sbin/portfwd"
 		else
-			warn "脚本没能装到 /usr/local/sbin/portfwd，开机只做 iptables-restore 兜底"
+			warn "脚本没能装到 /usr/local/sbin/portfwd，开机改由 iptables 服务恢复规则"
 		fi
 		if write_boot_hook; then
 			rc-update add local default >/dev/null 2>&1
@@ -564,7 +647,7 @@ persist() {
 		fi
 		ok "规则已保存，重启自动恢复"
 	else
-		warn "未检测到运行中的 OpenRC，跳过开机自启（容器请在启动命令里执行本脚本）"
+		warn "未检测到 systemd / OpenRC，跳过开机自启（容器请在启动命令里执行本脚本）"
 	fi
 }
 
@@ -593,8 +676,8 @@ ensure_ping() {
 	[ -n "$PKG" ] || detect_pkg
 	info "未检测到 ping，尝试安装 ..."
 	case "$PKG" in
-	apk) pkg_install iputils ;;
-	apt) pkg_install iputils-ping ;;
+	apk) pkg_ensure iputils ;;
+	apt) pkg_ensure iputils-ping ;;
 	dnf | yum | microdnf) pkg_install iputils ;;
 	opkg) pkg_install iputils-ping ;;
 	esac
@@ -833,6 +916,16 @@ commit() {
 	remind
 }
 
+# 记录需要持久化的放行端口（重启后由 boot 重放）
+record_open_port() {
+	for ro_p in "$@"; do
+		is_port "$ro_p" || continue
+		if [ ! -f "$OPEN_FILE" ] || ! grep -qxF "$ro_p" "$OPEN_FILE" 2>/dev/null; then
+			printf '%s\n' "$ro_p" >>"$OPEN_FILE" 2>/dev/null
+		fi
+	done
+}
+
 open_port_now() { # 端口...
 	for op_p in "$@"; do
 		is_port "$op_p" || return 1
@@ -840,6 +933,7 @@ open_port_now() { # 端口...
 		rule_add filter INPUT "portfwd:open:$op_p" "ACCEPT" -p udp --dport "$op_p"
 	done
 	rule_add filter INPUT "portfwd:ct" "ACCEPT" -m conntrack --ctstate RELATED,ESTABLISHED >/dev/null 2>&1
+	record_open_port "$@"
 	if command -v iptables-save >/dev/null 2>&1; then
 		iptables-save >/etc/iptables/rules-save 2>/dev/null
 	fi
@@ -1072,6 +1166,20 @@ cmd_apply() {
 	return 0
 }
 
+# 开机入口：只按 /etc/portfwd.conf 与 /etc/portfwd.open 重放我们自己的规则。
+# 刻意不还原整份 iptables-save 快照 —— 那会把 ufw / docker / fail2ban 等
+# 动态维护的 filter 链覆盖掉，反而搞坏系统网络。
+cmd_boot() {
+	if [ -r "$OPEN_FILE" ]; then
+		while read -r bo_p; do
+			[ -n "$bo_p" ] || continue
+			is_port "$bo_p" || continue
+			open_port_now "$bo_p"
+		done <"$OPEN_FILE"
+	fi
+	cmd_apply -q
+}
+
 cmd_list() {
 	need_root
 	ensure_iptables
@@ -1082,7 +1190,7 @@ cmd_list() {
 	echo
 	if [ -s "$CONF" ]; then
 		echo "== 映射列表（$CONF）=="
-		conf_read | while read -r ls_l ls_r ls_p ls_x; do
+		conf_read | while read -r ls_l ls_r ls_p _; do
 			[ -n "${ls_l:-}" ] || continue
 			printf '  本机 %-6s -> %s:%s   (TCP+UDP)\n' "$ls_l" "$ls_r" "$ls_p"
 		done
@@ -1108,7 +1216,7 @@ cmd_test() {
 	echo "== 规则检查 =="
 	bad=0
 	if conf_read | grep -q .; then
-		while read -r ts_l ts_r ts_p ts_x; do
+		while read -r ts_l ts_r ts_p _; do
 			[ -n "${ts_l:-}" ] || continue
 			if verify_entry "$ts_l" "$ts_r" "$ts_p"; then
 				echo "  [OK] 本机 $ts_l -> $ts_r:$ts_p"
@@ -1125,7 +1233,7 @@ EOF
 	echo
 	echo "== 落地机连通性 =="
 	if conf_read | grep -q .; then
-		while read -r tc_l tc_r tc_p tc_x; do
+		while read -r tc_l tc_r tc_p _; do
 			[ -n "${tc_l:-}" ] || continue
 			if command -v ping >/dev/null 2>&1; then
 				probe_line "$tc_r" 5 1
@@ -1171,10 +1279,16 @@ cmd_uninstall() {
 	need_root
 	ensure_iptables
 	probe_comment
-	echo "将删除：所有 portfwd 规则、$CONF、开机钩子、/usr/local/sbin/portfwd"
+	echo "将删除：所有 portfwd 规则、$CONF、开机自启配置、/usr/local/sbin/portfwd"
 	confirm "确定卸载？" || die "已取消"
 	del_tagged nat:PREROUTING nat:POSTROUTING filter:INPUT
-	rm -f "$CONF" /etc/local.d/portfwd.start /usr/local/sbin/portfwd /etc/sysctl.d/99-portfwd.conf
+	if [ -f /etc/systemd/system/portfwd.service ]; then
+		systemctl disable portfwd.service >/dev/null 2>&1
+		rm -f /etc/systemd/system/portfwd.service
+		systemctl daemon-reload >/dev/null 2>&1
+		ok "已移除 systemd 服务"
+	fi
+	rm -f "$CONF" "$OPEN_FILE" /etc/local.d/portfwd.start /usr/local/sbin/portfwd /etc/sysctl.d/99-portfwd.conf
 	if command -v iptables-save >/dev/null 2>&1; then
 		mkdir -p /etc/iptables
 		iptables-save >/etc/iptables/rules-save 2>/dev/null
@@ -1258,6 +1372,7 @@ main() {
 	rm | del | delete) shift; cmd_rm "$@" ;;
 	list | ls | show) cmd_list ;;
 	apply | sync) shift; cmd_apply "$@" ;;
+	boot) cmd_boot ;;
 	test | check) cmd_test ;;
 	open-port | open) shift; cmd_open_port "$@" ;;
 	uninstall | remove) cmd_uninstall ;;
