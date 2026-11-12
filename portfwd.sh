@@ -107,15 +107,24 @@ is_real_script() {
 	[ -f "$SELF" ]
 }
 
-# 启动时统一处理提权：能 sudo 就自己重跑一次
-# 注意不要用 sudo -E：Ubuntu/Debian 默认 sudoers 没有 SETENV，-E 会直接报错
+# 启动时统一处理提权，任何发行版都走同一套逻辑：
+#   1) 已经是 root      → 直接跑
+#   2) 有 sudo          → sudo 重跑（不加 -E，兼容默认 sudoers）
+#   3) 没有 sudo 有 su  → su 重跑（Alpine 等精简系统常见）
+#   4) 都没有            → 明确报错并给出通用提示
 escalate_if_needed() {
 	[ "$(id -u)" = "0" ] && return 0
-	if command -v sudo >/dev/null 2>&1 && is_real_script; then
-		info "需要 root，正在通过 sudo 重新执行 ..."
-		exec sudo sh "$SELF" "$@"
+	if is_real_script; then
+		if command -v sudo >/dev/null 2>&1; then
+			info "需要 root，正在通过 sudo 重新执行 ..."
+			exec sudo sh "$SELF" "$@"
+		fi
+		if [ $# -eq 0 ] && command -v su >/dev/null 2>&1 && [ -t 0 ]; then
+			info "需要 root 且系统没有 sudo，正在通过 su 重新执行 ..."
+			exec su -c "sh '$SELF'"
+		fi
 	fi
-	die "需要 root 权限。请用 sudo 运行：sudo sh $0"
+	die "需要 root 权限：以 root 登录后执行 sh $SELF，或安装 sudo 后重试"
 }
 
 # -----------------------------------------------------------------------------

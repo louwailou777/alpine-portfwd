@@ -18,25 +18,31 @@
 
 ## 环境要求
 
-- Linux 主机，root 权限（普通用户可用 `sudo`，脚本会自动提权重跑）
+- Linux 主机，root 权限（脚本在非 root 时会自动用 `sudo` 或 `su` 提权）
 - Alpine（OpenRC）、Debian 12+、Ubuntu 22.04+（systemd）
-- iptables：缺失时按 `apk` / `apt` / `dnf` / `yum` / `microdnf` / `opkg` 自动安装
+- 无需预装依赖：iptables、ping、基础命令缺失时按 `apk` / `apt` / `dnf` / `yum` / `microdnf` / `opkg` 自动安装
 - 内核需支持 nat 表；容器另需 `NET_ADMIN` / `NET_RAW` 能力
 
 ## 快速开始
 
+同一组命令适用于 Alpine、Debian、Ubuntu 及同类系统：
+
 ```sh
-curl -fsSL -o /tmp/portfwd.sh https://raw.githubusercontent.com/louwailou777/alpine-portfwd/main/portfwd.sh
+(command -v curl >/dev/null 2>&1 && curl -fsSL -o /tmp/portfwd.sh https://raw.githubusercontent.com/louwailou777/alpine-portfwd/main/portfwd.sh) ||
+  wget -qO /tmp/portfwd.sh https://raw.githubusercontent.com/louwailou777/alpine-portfwd/main/portfwd.sh
 head -n 1 /tmp/portfwd.sh
-sudo sh /tmp/portfwd.sh
+sh /tmp/portfwd.sh
 ```
 
-Alpine 无 `curl` 时改用 `wget -qO /tmp/portfwd.sh <同一地址>`。
+- 无需 `sudo` 前缀：脚本检测到非 root 时会自行提权（优先 `sudo`，没有则用 `su`）
+- 无需预装 iptables、ping 等依赖：脚本按系统包管理器自动安装
+- `head -n 1` 应输出 `#!/bin/sh`
 
 网络无法访问 `raw.githubusercontent.com` 时，在原始地址前拼接镜像前缀：
 
 ```sh
-curl -fsSL -o /tmp/portfwd.sh https://ghproxy.net/https://raw.githubusercontent.com/louwailou777/alpine-portfwd/main/portfwd.sh
+(command -v curl >/dev/null 2>&1 && curl -fsSL -o /tmp/portfwd.sh https://ghproxy.net/https://raw.githubusercontent.com/louwailou777/alpine-portfwd/main/portfwd.sh) ||
+  wget -qO /tmp/portfwd.sh https://ghproxy.net/https://raw.githubusercontent.com/louwailou777/alpine-portfwd/main/portfwd.sh
 ```
 
 可用前缀：`https://ghproxy.net/`、`https://gh-proxy.com/`。
