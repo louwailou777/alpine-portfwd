@@ -23,22 +23,40 @@
 
 ## 快速开始
 
-Alpine：
+先下载，并确认文件没下坏（首行必须是 `#!/bin/sh`）：
 
 ```sh
-wget -qO /tmp/portfwd.sh https://raw.githubusercontent.com/louwailou777/alpine-portfwd/main/portfwd.sh
-sh /tmp/portfwd.sh
+curl -fsSL --retry 3 -o /tmp/portfwd.sh https://raw.githubusercontent.com/louwailou777/alpine-portfwd/main/portfwd.sh
+head -n 1 /tmp/portfwd.sh
 ```
 
-Debian / Ubuntu（普通用户加 `sudo`）：
+再执行：
 
 ```sh
-curl -fsSL -o /tmp/portfwd.sh https://raw.githubusercontent.com/louwailou777/alpine-portfwd/main/portfwd.sh
 sudo sh /tmp/portfwd.sh
 ```
 
-> 系统没有 `curl` 就把第一条换成 `wget -qO /tmp/portfwd.sh <同一地址>`；
-> 两者都没有时先装一个：`apt-get install -y curl`。
+Alpine 上没有 `curl` 就用 `wget`：
+
+```sh
+wget -qO /tmp/portfwd.sh https://raw.githubusercontent.com/louwailou777/alpine-portfwd/main/portfwd.sh
+```
+
+### 国内网络
+
+`raw.githubusercontent.com` 在国内多数网络下无法直连，表现为 `/tmp/portfwd.sh` 为 0 字节，
+`sh` 执行后没有任何输出、直接返回提示符。此时改用镜像：
+
+```sh
+curl -fsSL -o /tmp/portfwd.sh https://ghproxy.net/https://raw.githubusercontent.com/louwailou777/alpine-portfwd/main/portfwd.sh
+head -n 1 /tmp/portfwd.sh
+sudo sh /tmp/portfwd.sh
+```
+
+可用镜像（把原始地址整段拼在镜像前缀后面）：
+
+- `https://ghproxy.net/` + 原始地址
+- `https://gh-proxy.com/` + 原始地址
 
 执行后进入交互式配置，依次为：
 
@@ -158,6 +176,8 @@ sysctl -w net.ipv4.ip_forward=1
 
 | 现象 | 排查方向 |
 | --- | --- |
+| `sudo sh /tmp/portfwd.sh` 后无任何输出、直接回提示符 | 脚本没下载成功（0 字节）。`ls -l /tmp/portfwd.sh` 确认大小，改用「国内网络」镜像重新下载 |
+| `head -n 1` 输出的不是 `#!/bin/sh` | 下到的是错误页或空文件，同样换镜像重下 |
 | 客户端连不上 | `portfwd.sh test` 检查规则与落地机连通性；确认路由/安全组已把外网端口映射到本机 NAT 端口 |
 | 落地机端口不通 | 落地机服务是否监听、防火墙是否放行 |
 | 能 ping 通但转发失败 | `net.ipv4.ip_forward` 是否为 1；`FORWARD` 链策略是否被改为 DROP |
