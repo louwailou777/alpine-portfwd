@@ -9,6 +9,7 @@
 
 - **幂等**：写入前经 `iptables -C` 校验，重复执行不产生重复规则
 - **可回收**：规则携带 `portfwd:` 标记，重放前清除历史规则，切换落地机无残留
+- **自动放行 FORWARD**：同时写入转发放行规则，ufw 默认 `routed: deny` 时也能正常转发
 - **线路预检**：配置前统计延迟与丢包，按阈值输出可用性结论
 - **持久化**：systemd 服务或 OpenRC 钩子，重启自动恢复
 - **多发行版**：Alpine、Debian、Ubuntu 及同类系统
@@ -121,6 +122,9 @@ portfwd.sh 10888 1.2.3.4 8443 10889 1.2.3.4 8080
 两种方式都只重建带 `portfwd:` 标记的规则，不还原整份 iptables 快照，
 避免覆盖 ufw、docker、fail2ban 等自行维护的链。
 
+> `ufw reload` / `ufw enable` 会重建整张 iptables 表，本项目的规则会被清掉，
+> 之后执行一次 `portfwd.sh apply` 即可恢复。
+
 ## 线路质量判定
 
 | 等级 | 条件 |
@@ -156,9 +160,10 @@ sysctl -w net.ipv4.ip_forward=1
 | --- | --- |
 | 执行后无任何输出 | 文件未下载完整，`ls -l /tmp/portfwd.sh` 确认大小后重新下载 |
 | 规则写入失败 | `iptables -t nat -L -n` 是否可用；容器需 `NET_ADMIN` |
+| DNAT 计数在涨但 MASQUERADE 为 0 | 包被 `FORWARD` 链拦下（ufw 默认 `routed: deny`）。确认 `iptables -S FORWARD \| grep portfwd` 有规则；修改 ufw 后需重新 `portfwd.sh apply` |
 | 客户端连不上 | `portfwd.sh test`；确认路由或安全组已映射到本机 NAT 端口 |
 | 落地机端口不通 | 落地机服务是否监听、防火墙是否放行 |
-| 能 ping 通但转发失败 | `net.ipv4.ip_forward` 是否为 1；`FORWARD` 链策略是否为 DROP |
+| 能 ping 通但转发失败 | `net.ipv4.ip_forward` 是否为 1；转发流量是否被 `FORWARD` 链丢弃 |
 | ping 100% 丢包 | 落地机可能屏蔽 ICMP，不代表 TCP 不通 |
 | Ubuntu/Debian 上端口放行无效 | 启用 ufw 时用 `ufw allow <端口>/tcp` 与 `/udp`，ufw 会覆盖手工 INPUT 规则 |
 | 重启后规则消失 | `systemctl status portfwd.service`；确认 `/etc/portfwd.conf` 存在 |

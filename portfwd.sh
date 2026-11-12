@@ -39,7 +39,7 @@
 # 说明：下面出现的 "-j $target" 有意不加引号 —— iptables 的 target 需要拆成多个
 # 参数（例如 DNAT --to-destination 1.2.3.4:443），因此本文件忽略 SC2086。
 # shellcheck disable=SC2086
-VERSION="1.1.1"
+VERSION="1.2.0"
 
 CONF=${CONF:-/etc/portfwd.conf}
 OPEN_FILE=${OPEN_FILE:-/etc/portfwd.open}
@@ -319,7 +319,7 @@ rule_del_plain() { # table chain "target [opts]" match...
 # （filter/INPUT 上的 open-port 放行规则不该被 apply 顺手删掉）
 # 实现上按规则序号删除，不依赖 sed/xargs —— 精简 busybox 里这些 applet 可能没编译进去
 del_tagged() {
-	[ $# -gt 0 ] || set -- nat:PREROUTING nat:POSTROUTING
+	[ $# -gt 0 ] || set -- nat:PREROUTING nat:POSTROUTING filter:FORWARD
 	for _dt_spec in "$@"; do
 		_dt_tbl=${_dt_spec%%:*}
 		_dt_chn=${_dt_spec##*:}
@@ -353,6 +353,12 @@ apply_entry() { # L R P
 			-p "$ae_proto" --dport "$ae_l"
 		rule_add nat POSTROUTING "portfwd:masq:$ae_proto:$ae_r:$ae_p" "MASQUERADE" \
 			-p "$ae_proto" -d "$ae_r" --dport "$ae_p"
+		# FORWARD 放行：ufw 默认「routed: deny」时，包在 FORWARD 链上会被丢，
+		# 表现为 DNAT 计数在涨、MASQUERADE 计数为 0。这里显式放行两个方向。
+		rule_add filter FORWARD "portfwd:fwd:$ae_proto:$ae_l:$ae_d" "ACCEPT" \
+			-d "$ae_r" -p "$ae_proto" --dport "$ae_p"
+		rule_add filter FORWARD "portfwd:fwd:$ae_proto:$ae_l:$ae_d" "ACCEPT" \
+			-s "$ae_r" -p "$ae_proto" --sport "$ae_p"
 	done
 }
 
@@ -365,6 +371,12 @@ verify_entry() { # L R P
 		rule_exists nat POSTROUTING "portfwd:masq:$ve_proto:$ve_r:$ve_p" "MASQUERADE" \
 			-p "$ve_proto" -d "$ve_r" --dport "$ve_p" \
 			|| { warn "缺少 MASQUERADE: $ve_proto -> $ve_d"; ve_bad=1; }
+		rule_exists filter FORWARD "portfwd:fwd:$ve_proto:$ve_l:$ve_d" "ACCEPT" \
+			-d "$ve_r" -p "$ve_proto" --dport "$ve_p" \
+			|| { warn "缺少 FORWARD 放行(out): $ve_proto -> $ve_d"; ve_bad=1; }
+		rule_exists filter FORWARD "portfwd:fwd:$ve_proto:$ve_l:$ve_d" "ACCEPT" \
+			-s "$ve_r" -p "$ve_proto" --sport "$ve_p" \
+			|| { warn "缺少 FORWARD 放行(in): $ve_proto <- $ve_d"; ve_bad=1; }
 	done
 	return "$ve_bad"
 }
@@ -398,9 +410,7 @@ EOF
 check_forward_policy() {
 	_fw=$($IPT -S FORWARD 2>/dev/null | awk '$1 == "-P" { print $2; exit }')
 	if [ "${_fw:-}" = "DROP" ]; then
-		warn "FORWARD 默认策略是 DROP，转发会被拦下。请执行："
-		warn "  iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
-		warn "  iptables -A FORWARD -d <落地机IP> -j ACCEPT"
+		ok "FORWARD 默认策略为 DROP，已通过 portfwd: 规则显式放行本项目的转发流量"
 	fi
 }
 
@@ -583,9 +593,9 @@ write_systemd_unit() {
 [Unit]
 Description=portfwd NAT forwarding rules
 Documentation=https://github.com/louwailou777/alpine-portfwd
-Before=network-pre.target
-Wants=network-pre.target
-After=local-fs.target
+After=local-fs.target ufw.service
+Before=network.target
+Wants=network.target
 
 [Service]
 Type=oneshot
@@ -1282,7 +1292,7 @@ cmd_uninstall() {
 	probe_comment
 	echo "将删除：所有 portfwd 规则、$CONF、开机自启配置、/usr/local/sbin/portfwd"
 	confirm "确定卸载？" || die "已取消"
-	del_tagged nat:PREROUTING nat:POSTROUTING filter:INPUT
+	del_tagged nat:PREROUTING nat:POSTROUTING filter:INPUT filter:FORWARD
 	if [ -f /etc/systemd/system/portfwd.service ]; then
 		systemctl disable portfwd.service >/dev/null 2>&1
 		rm -f /etc/systemd/system/portfwd.service
