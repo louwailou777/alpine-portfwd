@@ -39,7 +39,7 @@
 # 说明：下面出现的 "-j $target" 有意不加引号 —— iptables 的 target 需要拆成多个
 # 参数（例如 DNAT --to-destination 1.2.3.4:443），因此本文件忽略 SC2086。
 # shellcheck disable=SC2086
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 CONF=${CONF:-/etc/portfwd.conf}
 OPEN_FILE=${OPEN_FILE:-/etc/portfwd.open}
@@ -1010,9 +1010,9 @@ cmd_add() {
 	add_l=; add_r=; add_p=
 	while [ $# -gt 0 ]; do
 		case "$1" in
-		-l | --local-port) add_l=$2; shift 2 ;;
-		-r | --remote-ip) add_r=$2; shift 2 ;;
-		-p | --remote-port) add_p=$2; shift 2 ;;
+		-l | --local-port) [ $# -ge 2 ] || die "-l 缺少端口参数"; add_l=$2; shift 2 ;;
+		-r | --remote-ip) [ $# -ge 2 ] || die "-r 缺少 IP 参数"; add_r=$2; shift 2 ;;
+		-p | --remote-port) [ $# -ge 2 ] || die "-p 缺少端口参数"; add_p=$2; shift 2 ;;
 		-y | --yes) ASSUME_YES=1; shift ;;
 		-q | --quiet) QUIET=1; shift ;;
 		-h | --help) usage; return 0 ;;
@@ -1109,6 +1109,7 @@ cmd_probe() {
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--probe-count)
+			[ $# -ge 2 ] || die "--probe-count 缺少参数"
 			P_COUNT=$2
 			is_port "$P_COUNT" && [ "$P_COUNT" -le 100 ] ||
 				die "--probe-count 需要 1-100 的数字"
@@ -1351,6 +1352,7 @@ main() {
 		-q | --quiet) QUIET=1; shift ;;
 		--no-probe) NO_PROBE=1; shift ;;
 		--probe-count)
+			[ $# -ge 2 ] || die "--probe-count 缺少参数"
 			P_COUNT=$2
 			is_port "$P_COUNT" && [ "$P_COUNT" -le 100 ] ||
 				die "--probe-count 需要 1-100 的数字"
@@ -1364,7 +1366,9 @@ main() {
 
 	_cmd=${1:-wizard}
 	case "$_cmd" in
-	'' | wizard) shift 2>/dev/null || true; wizard ;;
+	# 不要在这里 shift：$# 为 0 时 shift 是 POSIX 特殊内建命令的失败，
+	# dash（Ubuntu/Debian 的 /bin/sh）会因此直接退出整个脚本，表现为「无任何输出」
+	'' | wizard) wizard ;;
 	help | -h | --help) usage ;;
 	-v | --version) echo "portfwd.sh $VERSION" ;;
 	add) shift; cmd_add "$@" ;;
